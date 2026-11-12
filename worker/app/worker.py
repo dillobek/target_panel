@@ -5,7 +5,7 @@ import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import db, diagnostics, jobs, reports, sync
-from .config import DIAGNOSTICS_TIME, TZ
+from .config import TZ
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("worker")
@@ -38,8 +38,7 @@ async def main():
     sch.add_job(safe(sync.process_events), "interval", minutes=1, **opts)
     sch.add_job(safe(reports.send_due_reports), "interval", minutes=1, **opts)
     sch.add_job(safe(jobs.run_pending), "interval", seconds=20, **opts)
-    h, m = map(int, DIAGNOSTICS_TIME.split(":"))
-    sch.add_job(safe(diagnostics.run_all), "cron", hour=h, minute=m, **opts)
+    sch.add_job(safe(diagnostics.run_all), "interval", minutes=1, **opts)  # vaqti adminkada
     sch.start()
 
     await safe(heartbeat)()

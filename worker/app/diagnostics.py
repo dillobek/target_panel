@@ -1,15 +1,14 @@
-"""Reklama tahlili: qoidalar asosida muammolarni topish (+ ixtiyoriy AI izoh)."""
+"""Reklama tahlili: ma'lumot yig'ish, qoidalar signallari va AI tahlili."""
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from . import db
-from .ai import explain
-from .config import ADMIN_CHAT_ID, TZ
+from . import ai, db, settings
+from .config import TZ
 from .crypto import decrypt
 from .meta import MetaClient, MetaError, insights_url
 from .metrics import RESULT_LABEL, aggregate, cost_per, results_from_actions
-from .notify import alert, e, get_rule, send
+from .notify import admin_chat, alert, e, get_rule, send
 
 log = logging.getLogger("diagnostics")
 
@@ -103,85 +102,196 @@ def analyse_placements(rows: list[dict], result_type: str) -> list[dict]:
     return findings
 
 
-async def diagnose_client(client) -> tuple[str, list[dict]]:
+def _m(row: dict, rt: str) -> dict:
+    """Bitta insights qatorini AI uchun ixcham ko'rinishga keltiradi."""
+    spend = round(float(row.get("spend") or 0), 2)
+    res = results_from_actions(row.get("actions"), rt)
+    imp = int(row.get("impressions") or 0)
+    clicks = int(row.get("clicks") or 0)
+    return {
+        "sarf": spend, "natija": res, "narx": cost_per(spend, res),
+        "ctr": round(clicks / imp * 100, 2) if imp else 0, "cpm": round(spend / imp * 1000, 2) if imp else 0,
+        "frequency": round(float(row["frequency"]), 2) if row.get("frequency") else None,
+    }
+
+
+async def collect(client) -> tuple[dict, list[dict]]:
+    """Mijozning barcha Meta accountlari bo'yicha ma'lumot to'plami va qoidalar signallari."""
     accounts = await _client_accounts(client["id"])
-    if not accounts:
-        return "", []
     rt = client["result_type"]
     spike = float((await get_rule(client["id"], "cpr_spike"))["threshold"] or 30)
     no_res = float((await get_rule(client["id"], "spend_no_result"))["threshold"] or 5)
-
-    findings: list[dict] = []
-    summary_lines = []
     end = datetime.now(TZ).date() - timedelta(days=1)
-    start = end - timedelta(days=6)
+    bundle: dict = {"davr_oxiri": str(end), "accountlar": []}
+    findings: list[dict] = []
+
     for acc in accounts:
-        daily = [dict(r) for r in await db.fetch(
+        daily14 = [dict(r) for r in await db.fetch(
             "SELECT * FROM insights_daily WHERE ad_account_id=$1 AND date BETWEEN $2 AND $3 ORDER BY date",
-            acc["id"], start, end)]
-        acc_findings = analyse_account(daily, rt, spike, no_res)
+            acc["id"], end - timedelta(days=13), end)]
+        daily7 = [r for r in daily14 if r["date"] >= end - timedelta(days=6)]
+        acc_findings = analyse_account(daily7, rt, spike, no_res)
+        item = {
+            "account": acc["name"], "valyuta": acc["currency"],
+            "kunlik": [{"sana": str(r["date"]), **_m(r, rt)} for r in daily14],
+            "jami_7_kun": aggregate(daily7, rt) if daily7 else None,
+        }
         try:
-            client_api = MetaClient(decrypt(acc["token_enc"]))
+            api = MetaClient(decrypt(acc["token_enc"]))
             ext = acc["external_id"]
-            ads_7d, ads_daily, places = await client_api.batch([
+            camps, ads7, adsd, places, demo = await api.batch([
+                insights_url(ext, level="campaign", date_preset="last_7d", limit=100,
+                             fields="campaign_name,objective,spend,impressions,clicks,frequency,actions"),
                 insights_url(ext, level="ad", date_preset="last_7d", limit=200,
-                             fields="ad_id,ad_name,spend,impressions,clicks,ctr,frequency,actions"),
+                             fields="ad_id,ad_name,adset_name,campaign_name,spend,impressions,clicks,ctr,frequency,actions"),
                 insights_url(ext, level="ad", date_preset="last_7d", time_increment=1, limit=1000,
                              fields="ad_id,ctr,impressions"),
                 insights_url(ext, level="account", date_preset="last_7d", breakdowns="publisher_platform",
                              fields="spend,clicks,impressions,actions"),
+                insights_url(ext, level="account", date_preset="last_7d", breakdowns="age,gender",
+                             fields="spend,clicks,impressions,actions"),
             ])
-            acc_findings += analyse_ads((ads_7d or {}).get("data", []), (ads_daily or {}).get("data", []), rt)
-            acc_findings += analyse_placements((places or {}).get("data", []), rt)
+            camps = (camps or {}).get("data", [])
+            ads7 = (ads7 or {}).get("data", [])
+            places = (places or {}).get("data", [])
+            demo = (demo or {}).get("data", [])
+            acc_findings += analyse_ads(ads7, (adsd or {}).get("data", []), rt)
+            acc_findings += analyse_placements(places, rt)
+            by_spend = lambda rows: sorted(rows, key=lambda r: -float(r.get("spend") or 0))  # noqa: E731
+            item["kampaniyalar"] = [{"nomi": r.get("campaign_name"), "maqsad": r.get("objective"), **_m(r, rt)}
+                                    for r in by_spend(camps)[:15]]
+            item["reklamalar"] = [{"nomi": r.get("ad_name"), "kampaniya": r.get("campaign_name"),
+                                   "adset": r.get("adset_name"), **_m(r, rt)} for r in by_spend(ads7)[:25]]
+            item["joylashuvlar"] = [{"joy": r.get("publisher_platform"), **_m(r, rt)} for r in by_spend(places)]
+            item["yosh_jins"] = [{"yosh": r.get("age"), "jins": r.get("gender"), **_m(r, rt)}
+                                 for r in by_spend(demo)[:14]]
         except MetaError as ex:
             log.warning("Tahlil uchun Meta xatosi (%s): %s", acc["name"], ex)
+            item["xato"] = f"Batafsil ma'lumot olinmadi: {ex}"
         for f in acc_findings:
             f["account"] = acc["name"]
         findings += acc_findings
-        if daily:
-            agg = aggregate(daily, rt)
-            summary_lines.append(
-                f"{acc['name']} ({acc['currency']}): 7 kun sarf {agg['spend']}, "
-                f"{RESULT_LABEL.get(rt, 'natija')} {agg['results']}, narxi {agg['cpr']}, CTR {agg['ctr']}%, CPM {agg['cpm']}"
-            )
-    return "\n".join(summary_lines), findings
+        bundle["accountlar"].append(item)
+    return bundle, findings
 
 
 ICON = {"high": "❗", "medium": "⚠️", "low": "ℹ️"}
+AI_LEVEL = {"yuqori": "❗", "o'rta": "⚠️", "past": "ℹ️"}
+AI_STATE = {"yaxshi": "🟢 yaxshi", "o'rtacha": "🟡 o'rtacha", "yomon": "🔴 yomon"}
 
 
-async def run_for_client(client, to_chat: int = ADMIN_CHAT_ID) -> None:
-    summary, findings = await diagnose_client(client)
-    if not summary:
-        return
-    # Muhim topilmalar alert sifatida ham (qoida "mijozga ham" desa guruhga ham boradi)
-    today = datetime.now(TZ).date()
-    for f in findings:
-        if f["type"] in ("cpr_spike", "spend_no_result"):
-            await alert(f["type"], f"diag:{client['id']}:{f['type']}:{f['account']}:{today}",
-                        f"{ICON[f['severity']]} {e(f['account'])}: {e(f['text'])}", client_id=client["id"])
+def format_analysis(client_name: str, day, findings: list[dict], ai_json: dict | None, ai_text: str | None,
+                    ai_error: str | None) -> str:
+    lines = [f"🤖 <b>{e(client_name)}</b> — AI tahlil ({day:%d.%m})"]
+    if ai_json:
+        lines.append(f"Holat: {AI_STATE.get(ai_json.get('holat'), e(ai_json.get('holat', '—')))}")
+        if ai_json.get("xulosa"):
+            lines.append(e(ai_json["xulosa"]))
+        probs = ai_json.get("muammolar") or []
+        if probs:
+            lines.append("\n<b>Muammolar</b>")
+            for i, p in enumerate(probs, 1):
+                lines.append(f"{AI_LEVEL.get(p.get('daraja'), '•')} {i}. <i>{e(p.get('joy', ''))}</i>: {e(p.get('muammo', ''))}")
+                if p.get("sabab"):
+                    lines.append(f"   Sabab: {e(p['sabab'])}")
+                if p.get("tavsiya"):
+                    lines.append(f"   👉 {e(p['tavsiya'])}")
+        if ai_json.get("imkoniyatlar"):
+            lines.append("\n<b>💡 Imkoniyatlar</b>")
+            lines += [f"• {e(x)}" for x in ai_json["imkoniyatlar"]]
+        if ai_json.get("qadamlar"):
+            lines.append("\n<b>✅ Bugungi qadamlar</b>")
+            lines += [f"{i}. {e(x)}" for i, x in enumerate(ai_json["qadamlar"], 1)]
+        return "\n".join(lines)
 
-    lines = [f"🔍 <b>{e(client['name'])}</b> — tahlil ({today - timedelta(days=1):%d.%m})"]
+    if ai_text:  # JSON emas, lekin matn bor
+        lines.append(e(ai_text))
+        return "\n".join(lines)
+
+    lines[0] = f"🔍 <b>{e(client_name)}</b> — tahlil ({day:%d.%m})"
     if findings:
         for f in sorted(findings, key=lambda x: ["high", "medium", "low"].index(x["severity"])):
             lines.append(f"{ICON[f['severity']]} <i>{e(f['account'])}</i>: {e(f['text'])}")
     else:
-        lines.append("✅ Jiddiy muammo topilmadi.")
-    ai_text = await explain(client["name"], summary, findings)
-    if ai_text:
-        lines.append("\n🤖 <b>AI xulosa</b>\n" + e(ai_text))
-    await send(to_chat, "\n".join(lines))
+        lines.append("✅ Qoidalar jiddiy muammo topmadi.")
+    if ai_error:
+        lines.append(f"\n<i>AI ishlamadi: {e(ai_error)}</i>")
+    return "\n".join(lines)
+
+
+async def run_for_client(client, kind: str = "daily", to_chat: int | None = None) -> int | None:
+    """Tahlil qiladi, bazaga saqlaydi va Telegram'ga yuboradi. Qaytaradi: analyses.id"""
+    bundle, findings = await collect(client)
+    if not bundle["accountlar"]:
+        if to_chat:
+            await send(to_chat, f"{e(client['name'])}: Meta account biriktirilmagan.")
+        return None
+    today = datetime.now(TZ).date()
+    for f in findings:  # muhim signallar alert sifatida ham (qoida ruxsat bersa guruhga)
+        if kind == "daily" and f["type"] in ("cpr_spike", "spend_no_result"):
+            await alert(f["type"], f"diag:{client['id']}:{f['type']}:{f['account']}:{today}",
+                        f"{ICON[f['severity']]} {e(f['account'])}: {e(f['text'])}", client_id=client["id"])
+
+    ai_json = ai_text = model = ai_error = None
+    try:
+        ai_json, ai_text, model = await ai.analyse(client["name"], RESULT_LABEL.get(client["result_type"], "Natija"),
+                                                   bundle, findings)
+    except ai.AiDisabled as ex:
+        ai_error = str(ex)
+    except Exception as ex:  # noqa: BLE001
+        log.exception("AI tahlil xatosi")
+        ai_error = str(ex)[:300]
+
+    analysis_id = await db.fetchval(
+        """INSERT INTO analyses (client_id, kind, findings, ai_json, ai_text, model, error)
+           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
+        client["id"], kind, [{k: f[k] for k in ("type", "severity", "text", "account")} for f in findings],
+        ai_json, None if ai_json else ai_text, model, ai_error,
+    )
+    text = format_analysis(client["name"], today - timedelta(days=1), findings, ai_json, ai_text, ai_error)
+    await send(to_chat or await admin_chat(), text)
+    if client.get("ai_to_group") and ai_json:
+        group = await db.fetchval(
+            "SELECT g.chat_id FROM clients c JOIN tg_groups g ON g.id=c.group_id AND g.active WHERE c.id=$1", client["id"])
+        if group:
+            await send(group, text)
+    return analysis_id
+
+
+async def ask(client, question: str) -> tuple[int, str]:
+    bundle, _ = await collect(client)
+    if not bundle["accountlar"]:
+        return 0, "Bu mijozga Meta account biriktirilmagan."
+    try:
+        text, model = await ai.answer(client["name"], RESULT_LABEL.get(client["result_type"], "Natija"), bundle, question)
+        err = None
+    except ai.AiDisabled as ex:
+        text, model, err = str(ex), None, str(ex)
+    aid = await db.fetchval(
+        "INSERT INTO analyses (client_id, kind, question, ai_text, model, error) VALUES ($1,'question',$2,$3,$4,$5) RETURNING id",
+        client["id"], question, text, model, err)
+    return aid, text
+
+
+def _in_window(now: datetime, hhmm: str, hours: int = 3) -> bool:
+    h, m = map(int, hhmm.split(":"))
+    minutes = now.hour * 60 + now.minute
+    return h * 60 + m <= minutes <= h * 60 + m + hours * 60
 
 
 async def run_all() -> None:
-    today = datetime.now(TZ).date()
+    """Har daqiqada chaqiriladi; adminkadagi tahlil vaqti kelganda har bir mijozni bir marta tahlil qiladi."""
+    now = datetime.now(TZ)
+    if not _in_window(now, await settings.diagnostics_time()):
+        return
+    today = now.date()
     for c in await db.fetch("SELECT * FROM clients WHERE diagnostics = true"):
         done = await db.fetchval(
             "SELECT 1 FROM reports_log WHERE client_id=$1 AND kind='diagnostics' AND period=$2", c["id"], today)
         if done:
             continue
         try:
-            await run_for_client(c)
+            await run_for_client(dict(c))
             ok, err = True, None
         except Exception as ex:  # noqa: BLE001
             log.exception("Tahlil xatosi: %s", c["name"])

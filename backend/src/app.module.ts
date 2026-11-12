@@ -4,6 +4,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { ApiController } from './api.controller';
 import { AuthController, AuthGuard } from './auth';
 import { DbService } from './db.service';
+import { SettingsController } from './settings.controller';
 import { WebhookController } from './webhook.controller';
 
 @Module({
@@ -14,7 +15,7 @@ import { WebhookController } from './webhook.controller';
       signOptions: { expiresIn: '7d' },
     }),
   ],
-  controllers: [AuthController, ApiController, WebhookController],
+  controllers: [AuthController, ApiController, SettingsController, WebhookController],
   providers: [DbService, { provide: APP_GUARD, useClass: AuthGuard }],
 })
 export class AppModule {}

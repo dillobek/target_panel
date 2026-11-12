@@ -6,18 +6,32 @@ from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
-from . import db
-from .config import ADMIN_CHAT_ID, BOT_TOKEN
+from . import db, settings
 
 log = logging.getLogger("notify")
 _bot: Bot | None = None
+_bot_token: str | None = None
 
 
-def bot() -> Bot:
-    global _bot
-    if _bot is None:
-        _bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+def make_bot(token: str) -> Bot:
+    return Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+
+async def get_bot() -> Bot | None:
+    """Token adminkada o'zgarsa, yangi Bot obyekti yaratiladi."""
+    global _bot, _bot_token
+    token = await settings.bot_token()
+    if not token:
+        return None
+    if token != _bot_token:
+        if _bot is not None:
+            await _bot.session.close()
+        _bot, _bot_token = make_bot(token), token
     return _bot
+
+
+async def admin_chat() -> int:
+    return await settings.admin_chat_id()
 
 
 def e(text) -> str:
@@ -28,9 +42,13 @@ async def send(chat_id: int, text: str) -> bool:
     if not chat_id:
         log.warning("chat_id yo'q, xabar yuborilmadi")
         return False
+    b = await get_bot()
+    if b is None:
+        log.warning("Bot tokeni adminkada kiritilmagan, xabar yuborilmadi")
+        return False
     try:
         for i in range(0, len(text), 4000):  # Telegram 4096 belgi chegarasi
-            await bot().send_message(chat_id, text[i : i + 4000], disable_web_page_preview=True)
+            await b.send_message(chat_id, text[i : i + 4000], disable_web_page_preview=True)
         return True
     except Exception as ex:  # noqa: BLE001
         log.error("Telegram yuborishda xato (%s): %s", chat_id, ex)
@@ -90,7 +108,7 @@ async def alert(rule_type: str, dedupe_key: str, text: str, ad_account_id: int |
 
     names = ", ".join(c["name"] for c in clients)
     header = f"🔔 <b>{e(names)}</b>\n" if names else "🔔 "
-    targets.append((ADMIN_CHAT_ID, "admin"))
+    targets.append((await admin_chat(), "admin"))
     for c in clients:
         c_rule = await get_rule(c["id"], rule_type)
         if c_rule["notify_client"] and c["chat_id"]:

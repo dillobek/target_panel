@@ -72,7 +72,7 @@ $('#login-form').addEventListener('submit', async (e) => {
 $('#logout').addEventListener('click', logout);
 
 // ---------------- Router ----------------
-const pages = { ulanishlar: pageConnections, accountlar: pageAccounts, mijozlar: pageClients, alertlar: pageAlerts, tarix: pageLog };
+const pages = { ulanishlar: pageConnections, accountlar: pageAccounts, mijozlar: pageClients, tahlil: pageAnalysis, alertlar: pageAlerts, tarix: pageLog, sozlamalar: pageSettings };
 
 async function route() {
   const [name, arg] = (location.hash.slice(1) || 'ulanishlar').split('/');
@@ -135,8 +135,9 @@ async function pageConnections(main) {
         <button class="btn primary" type="submit">Saqlash</button></form>
     </div>
     <section class="card"><div class="row between"><div><h2>Telegram bot</h2>
-      <p class="muted">Botni mijoz guruhiga admin qilib qo'shing — guruh "Mijozlar" sahifasida avtomatik paydo bo'ladi.</p>
-      <div>Bot: <b class="mono">@${esc(CONFIG.botUsername || 'BOT_USERNAME .env da yo‘q')}</b></div></div>
+      ${CONFIG.botUsername
+        ? `<p class="muted">Botni mijoz guruhiga admin qilib qo'shing — guruh "Mijozlar" sahifasida avtomatik paydo bo'ladi.</p><div>Bot: <b class="mono">@${esc(CONFIG.botUsername)}</b></div>`
+        : `<p class="muted">Bot hali ulanmagan. <a href="#sozlamalar">Sozlamalar</a> sahifasida bot tokenini kiriting.</p>`}</div>
       <div class="row">${stats.free_groups ? `<span class="pill warn">${stats.free_groups} ta guruh biriktirilmagan</span>` : ''}
         ${addLink ? `<a class="btn primary" style="display:flex;align-items:center;text-decoration:none" href="${addLink}" target="_blank" rel="noopener">Guruhga qo'shish</a>` : ''}</div></div></section>`;
 
@@ -237,11 +238,12 @@ async function renderClient(el, id) {
       <div class="row">
         <label class="row"><input id="c-daily" type="checkbox" ${c.report_daily ? 'checked' : ''}> Kunlik hisobot</label>
         <label class="row"><input id="c-weekly" type="checkbox" ${c.report_weekly ? 'checked' : ''}> Haftalik (dushanba 10:00)</label>
-        <label class="row"><input id="c-diag" type="checkbox" ${c.diagnostics ? 'checked' : ''}> Kunlik tahlil (sizga)</label>
+        <label class="row"><input id="c-diag" type="checkbox" ${c.diagnostics ? 'checked' : ''}> Kunlik AI tahlil (sizga)</label>
+        <label class="row"><input id="c-aigroup" type="checkbox" ${c.ai_to_group ? 'checked' : ''}> AI tahlilni mijoz guruhiga ham</label>
       </div>
       <div class="row"><button class="btn primary" type="submit">Saqlash</button>
         <button id="c-test" class="btn" type="button">Sinov hisobotini yuborish</button>
-        <button id="c-diag-now" class="btn" type="button">Hozir tahlil qilish</button>
+        <a class="btn" style="display:flex;align-items:center;text-decoration:none" href="#tahlil/${id}">AI tahlil</a>
         <button id="c-del" class="btn danger" type="button">Mijozni o'chirish</button></div>
     </form>
     <section class="card"><h2>Reklama manbalari</h2>
@@ -262,7 +264,7 @@ async function renderClient(el, id) {
       await api('PATCH', `/clients/${id}`, {
         name: $('#c-name').value, result_type: $('#c-result').value, group_id: $('#c-group').value || null,
         report_daily_time: $('#c-time').value, report_daily: $('#c-daily').checked,
-        report_weekly: $('#c-weekly').checked, diagnostics: $('#c-diag').checked,
+        report_weekly: $('#c-weekly').checked, diagnostics: $('#c-diag').checked, ai_to_group: $('#c-aigroup').checked,
       });
       toast('Saqlandi');
       route();
@@ -271,10 +273,6 @@ async function renderClient(el, id) {
   $('#c-test').addEventListener('click', (e) => withBtn(e.target, async () => {
     await api('POST', `/clients/${id}/test-report`);
     toast('Sinov hisobot 30 soniya ichida guruhga yuboriladi');
-  }));
-  $('#c-diag-now').addEventListener('click', (e) => withBtn(e.target, async () => {
-    await api('POST', `/clients/${id}/diagnostics`);
-    toast('Tahlil tayyorlanmoqda — natija sizga Telegram’da keladi');
   }));
   $('#c-del').addEventListener('click', (e) => {
     if (!confirm('Mijoz o‘chirilsinmi?')) return;
@@ -335,6 +333,167 @@ async function pageLog(main) {
       <td>${esc((RULES[r.type] || [r.type])[0])}</td><td>${esc(r.client || '—')}</td>
       <td style="white-space:pre-line">${esc(r.message)}</td><td class="mono">${esc(r.sent_to || '')}</td></tr>`).join('')
       : '<tr><td colspan="5" class="empty">Hali alert yo‘q</td></tr>'}</tbody></table></div>`;
+}
+
+// ---------------- Job kutish ----------------
+async function waitJob(id, timeoutMs = 180000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 2500));
+    const j = await api('GET', `/jobs/${id}`);
+    if (j.status === 'done') return j;
+    if (j.status === 'error') throw new Error(j.error || 'Xatolik');
+  }
+  throw new Error('Kutish vaqti tugadi — worker ishlayaptimi?');
+}
+
+// ---------------- 6. AI tahlil ----------------
+const STATE = { yaxshi: ['Yaxshi', 'ok'], "o'rtacha": ["O'rtacha", 'warn'], yomon: ['Yomon', 'bad'] };
+const LEVEL = { yuqori: ['Yuqori', 'bad'], "o'rta": ["O'rta", 'warn'], past: ['Past', 'gray'] };
+const SEV = { high: 'bad', medium: 'warn', low: 'gray' };
+
+function renderAnalysis(a) {
+  const when = esc(new Date(a.created_at).toLocaleString('uz-UZ'));
+  if (a.kind === 'question') {
+    return `<div class="analysis"><div class="row between"><h3>Savol: ${esc(a.question)}</h3><span class="mono">${when}</span></div>
+      <div class="answer">${esc(a.ai_text || a.error || '')}</div></div>`;
+  }
+  const j = a.ai_json;
+  let body = '';
+  if (j) {
+    const st = STATE[j.holat] || [esc(j.holat || '—'), 'gray'];
+    body += `<div class="row"><span class="pill ${st[1]}">Holat: ${st[0]}</span></div><p style="margin:0">${esc(j.xulosa || '')}</p>`;
+    if ((j.muammolar || []).length) {
+      body += '<h3>Muammolar</h3>' + j.muammolar.map((p) => {
+        const lv = LEVEL[p.daraja] || ['—', 'gray'];
+        return `<div class="prob"><div class="row"><span class="pill ${lv[1]}">${lv[0]}</span><b>${esc(p.joy || '')}</b></div>
+          <div>${esc(p.muammo || '')}</div>${p.sabab ? `<div class="muted">Sabab: ${esc(p.sabab)}</div>` : ''}
+          ${p.tavsiya ? `<div class="tip">👉 ${esc(p.tavsiya)}</div>` : ''}</div>`;
+      }).join('');
+    }
+    if ((j.imkoniyatlar || []).length) body += '<h3>Imkoniyatlar</h3><ul>' + j.imkoniyatlar.map((x) => `<li>${esc(x)}</li>`).join('') + '</ul>';
+    if ((j.qadamlar || []).length) body += '<h3>Bugungi qadamlar</h3><ol>' + j.qadamlar.map((x) => `<li>${esc(x)}</li>`).join('') + '</ol>';
+  } else {
+    if (a.ai_text) body += `<div class="answer">${esc(a.ai_text)}</div>`;
+    if (a.error) body += `<p class="error">AI: ${esc(a.error)}</p>`;
+    body += (a.findings || []).length
+      ? '<h3>Qoidalar signallari</h3>' + a.findings.map((f) => `<div class="row"><span class="pill ${SEV[f.severity] || 'gray'}">${esc(f.account)}</span> ${esc(f.text)}</div>`).join('')
+      : '<p class="muted">Qoidalar jiddiy muammo topmadi.</p>';
+  }
+  return `<div class="analysis"><div class="row between"><h3>${a.kind === 'daily' ? 'Kunlik tahlil' : "Qo'lda tahlil"}</h3>
+    <span class="mono">${when}${a.model ? ' · ' + esc(a.model) : ''}</span></div>${body}</div>`;
+}
+
+async function pageAnalysis(main, idArg) {
+  const [clients, st] = await Promise.all([api('GET', '/clients'), api('GET', '/settings')]);
+  const id = Number(idArg) || (clients[0] && clients[0].id);
+  const aiReady = st.ai.enabled && st.ai.key_set;
+  main.innerHTML = `
+    <div><h1>AI tahlil</h1><p class="sub">AI har bir mijozning kampaniya, reklama, joylashuv va auditoriya ma'lumotlarini ko'rib, muammo va tavsiyalarni beradi.</p></div>
+    ${aiReady ? '' : `<p class="pill warn" style="align-self:flex-start">AI ulanmagan — <a href="#sozlamalar">Sozlamalar</a>da Anthropic API kalitini kiriting</p>`}
+    ${clients.length ? `<div class="split">
+      <section class="list" aria-label="Mijozlar">${clients.map((c) => `<a href="#tahlil/${c.id}" class="${c.id === id ? 'active' : ''}"><b>${esc(c.name)}</b>
+        <div class="small muted">${c.meta_sources} Meta account</div></a>`).join('')}</section>
+      <div class="detail">
+        <section class="card"><div class="row between"><h2>${esc((clients.find((c) => c.id === id) || {}).name || '')}</h2>
+          <button id="run-ai" class="btn primary" type="button">Hozir tahlil qilish</button></div>
+          <form id="f-ask" class="row"><label for="q" style="position:absolute;width:1px;height:1px;overflow:hidden">Savol</label>
+            <input id="q" type="text" placeholder="AI'dan so'rang: nega bu hafta lid qimmatlashdi?" style="flex:1 1 300px" maxlength="1000">
+            <button class="btn" type="submit">So'rash</button></form>
+          <p id="ai-status" class="muted small" role="status"></p></section>
+        <div id="analyses" class="card"><p class="muted">Yuklanmoqda…</p></div>
+      </div></div>` : '<p class="empty">Avval mijoz qo‘shing.</p>'}`;
+  if (!id) return;
+  const load = async () => {
+    const rows = await api('GET', `/clients/${id}/analyses`);
+    $('#analyses').innerHTML = rows.length ? rows.map(renderAnalysis).join('') : '<p class="empty">Hali tahlil yo‘q. «Hozir tahlil qilish»ni bosing.</p>';
+  };
+  await load();
+  const run = (btn, path, body, msg) => withBtn(btn, async () => {
+    $('#ai-status').textContent = msg;
+    const j = await api('POST', path, body);
+    try { await waitJob(j.id); } finally { $('#ai-status').textContent = ''; }
+    await load();
+  });
+  $('#run-ai').addEventListener('click', (e) => run(e.target, `/clients/${id}/diagnostics`, null, 'Tahlil qilinmoqda (30–90 soniya)…'));
+  $('#f-ask').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const q = $('#q').value.trim();
+    if (!q) { toast('Savol yozing'); return; }
+    run(e.submitter, `/clients/${id}/ask`, { question: q }, "AI o'ylayapti…").then(() => { $('#q').value = ''; });
+  });
+}
+
+// ---------------- 7. Sozlamalar ----------------
+async function pageSettings(main) {
+  const s = await api('GET', '/settings');
+  const botOk = s.bot.connected && (!s.bot.status || s.bot.status === 'ok' || s.bot.status === 'restarting');
+  main.innerHTML = `
+    <div><h1>Sozlamalar</h1><p class="sub">Bot va AI shu yerdan ulanadi — serverga kirish shart emas.</p></div>
+    <div class="grid2">
+      <form id="f-bot" class="card"><div class="row between"><h2>Telegram bot</h2>
+        ${s.bot.connected ? `<span class="pill ${botOk ? 'ok' : 'bad'}">${botOk ? 'Ulangan' : 'Xato'}</span>` : '<span class="pill gray">Ulanmagan</span>'}</div>
+        ${s.bot.username ? `<div>Bot: <b class="mono">@${esc(s.bot.username)}</b>${s.bot.token_last4 ? ` · token •••• ${esc(s.bot.token_last4)}` : ''}</div>` : ''}
+        ${s.bot.status && s.bot.status.startsWith('error') ? `<p class="error">${esc(s.bot.status)}</p>` : ''}
+        <div class="field"><label for="b-token">${s.bot.connected ? 'Yangi token (almashtirish uchun)' : 'Bot tokeni'}</label>
+          <input id="b-token" type="password" placeholder="123456789:AA…" autocomplete="off" required></div>
+        <p class="muted small">@BotFather → /newbot → tokenni nusxalang. Saqlangach bot 15 soniyada ishga tushadi.</p>
+        <button class="btn primary" type="submit">Tekshirish va saqlash</button></form>
+
+      <section class="card"><h2>Admin (alertlar va tahlil kimga)</h2>
+        <div>Hozirgi admin: ${s.admin_chat_id ? `<b>${esc(s.admin_chat_name || '')}</b> <span class="mono">${esc(s.admin_chat_id)}</span>` : '<span class="pill warn">belgilanmagan</span>'}</div>
+        <p class="muted small">Botga Telegram'da <b>/start</b> yozing — siz shu ro'yxatda paydo bo'lasiz. Keyin «Admin qilib belgilash»ni bosing.</p>
+        <div>${(s.starters || []).length ? s.starters.map((u) => `<div class="source"><div><b>${esc(u.name)}</b>
+          <div class="mono">${u.username ? '@' + esc(u.username) + ' · ' : ''}${esc(u.id)}</div></div>
+          <button class="btn" type="button" data-admin="${esc(u.id)}" data-name="${esc(u.name)}">${String(u.id) === String(s.admin_chat_id) ? 'Admin ✓' : 'Admin qilib belgilash'}</button></div>`).join('')
+          : '<p class="muted">Hali hech kim /start yozmagan.</p>'}</div>
+        <div class="row"><button id="refresh-starters" class="btn" type="button">Ro'yxatni yangilash</button>
+          <button id="test-admin" class="btn" type="button">Sinov xabari</button></div></section>
+    </div>
+    <form id="f-ai" class="card"><div class="row between"><h2>AI tahlil (Claude)</h2>
+      ${s.ai.key_set ? `<span class="pill ${s.ai.enabled ? 'ok' : 'gray'}">${s.ai.enabled ? 'Yoqilgan' : "O'chirilgan"}</span>` : '<span class="pill gray">Kalit yo‘q</span>'}</div>
+      <div class="grid2">
+        <div class="field"><label for="ai-key">Anthropic API kaliti${s.ai.key_last4 ? ` (hozirgi •••• ${esc(s.ai.key_last4)})` : ''}</label>
+          <input id="ai-key" type="password" placeholder="${s.ai.key_set ? "O'zgartirmaslik uchun bo'sh qoldiring" : 'sk-ant-…'}" autocomplete="off"></div>
+        <div class="field"><label for="ai-model">Model</label><select id="ai-model">
+          ${s.ai.models.map((m) => `<option value="${m}" ${m === s.ai.model ? 'selected' : ''}>${m}${m.includes('sonnet') ? ' (tavsiya)' : m.includes('opus') ? ' (eng kuchli, qimmatroq)' : ' (tez, arzon)'}</option>`).join('')}</select></div>
+        <div class="field"><label for="ai-time">Kunlik tahlil vaqti</label><input id="ai-time" type="time" value="${esc(s.diagnostics_time)}"></div>
+      </div>
+      <label class="row"><input id="ai-on" type="checkbox" ${s.ai.enabled ? 'checked' : ''}> AI tahlil yoqilgan</label>
+      <p class="muted small">Kalit: console.anthropic.com → API Keys. Kalit shifrlangan holda saqlanadi.</p>
+      <div><button class="btn primary" type="submit">Saqlash</button></div></form>`;
+
+  $('#f-bot').addEventListener('submit', (e) => {
+    e.preventDefault();
+    withBtn(e.submitter, async () => {
+      const r = await api('PUT', '/settings/bot', { token: $('#b-token').value });
+      CONFIG.botUsername = r.username;
+      toast(`@${r.username} ulandi. Endi botga /start yozing.`);
+      route();
+    });
+  });
+  main.querySelectorAll('[data-admin]').forEach((b) => b.addEventListener('click', () => withBtn(b, async () => {
+    await api('PUT', '/settings/admin-chat', { chat_id: b.dataset.admin, name: b.dataset.name });
+    toast('Admin belgilandi');
+    route();
+  })));
+  $('#refresh-starters').addEventListener('click', route);
+  $('#test-admin').addEventListener('click', (e) => withBtn(e.target, async () => {
+    const j = await api('POST', '/settings/test-message');
+    await waitJob(j.id, 60000);
+    toast('Sinov xabari yuborildi');
+  }));
+  $('#f-ai').addEventListener('submit', (e) => {
+    e.preventDefault();
+    withBtn(e.submitter, async () => {
+      await api('PUT', '/settings/ai', {
+        api_key: $('#ai-key').value, model: $('#ai-model').value,
+        enabled: $('#ai-on').checked, diagnostics_time: $('#ai-time').value,
+      });
+      toast('Saqlandi');
+      route();
+    });
+  });
 }
 
 if (TOKEN) start(); else logout();

@@ -22,6 +22,8 @@ services:
     environment:
       DATABASE_URL: postgresql://targetpanel:${DB_PASSWORD}@db:5432/targetpanel
       PORT: "3000"
+    volumes:
+      - ./db:/app/db:ro
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:
@@ -33,6 +35,8 @@ services:
     command: python -m app.worker
     restart: always
     env_file: .env
+    volumes:
+      - ./db:/app/db:ro
     environment:
       DATABASE_URL: postgresql://targetpanel:${DB_PASSWORD}@db:5432/targetpanel
     depends_on:
@@ -44,6 +48,8 @@ services:
     command: python -m app.bot
     restart: always
     env_file: .env
+    volumes:
+      - ./db:/app/db:ro
     environment:
       DATABASE_URL: postgresql://targetpanel:${DB_PASSWORD}@db:5432/targetpanel
     depends_on:

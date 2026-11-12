@@ -25,15 +25,21 @@ function str(v: unknown, field: string, max = 200): string {
   return v.trim();
 }
 
+async function metaGet(url: string): Promise<any> {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(20000) });
+    return await r.json();
+  } catch {
+    throw new BadRequestException("Meta'ga ulanib bo'lmadi — server internetini tekshiring");
+  }
+}
+
 async function verifyMetaToken(token: string): Promise<string> {
-  const url = `https://graph.facebook.com/${META_V()}/me?fields=id,name&access_token=${encodeURIComponent(token)}`;
-  const r = await fetch(url);
-  const j: any = await r.json();
+  const j = await metaGet(`https://graph.facebook.com/${META_V()}/me?fields=id,name&access_token=${encodeURIComponent(token)}`);
   if (j.error) throw new BadRequestException('Meta token xato: ' + j.error.message);
-  const acc = await fetch(
+  const aj = await metaGet(
     `https://graph.facebook.com/${META_V()}/me/adaccounts?fields=name&limit=1&access_token=${encodeURIComponent(token)}`,
   );
-  const aj: any = await acc.json();
   if (aj.error) throw new BadRequestException("Token reklama accountlarini o'qiy olmaydi: " + aj.error.message);
   return j.name ?? 'Meta';
 }
@@ -44,8 +50,9 @@ export class ApiController {
 
   // ---------- Umumiy ----------
   @Get('config')
-  config() {
-    return { botUsername: process.env.BOT_USERNAME ?? '' };
+  async config() {
+    const r = await this.db.one("SELECT value FROM settings WHERE key='bot_username'");
+    return { botUsername: r?.value ?? process.env.BOT_USERNAME ?? '' };
   }
 
   @Get('stats')
@@ -169,6 +176,7 @@ export class ApiController {
     if (b.report_daily !== undefined) add('report_daily', !!b.report_daily);
     if (b.report_weekly !== undefined) add('report_weekly', !!b.report_weekly);
     if (b.diagnostics !== undefined) add('diagnostics', !!b.diagnostics);
+    if (b.ai_to_group !== undefined) add('ai_to_group', !!b.ai_to_group);
     if (b.report_daily_time !== undefined) {
       if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(b.report_daily_time)) throw new BadRequestException('Vaqt HH:MM formatida');
       add('report_daily_time', b.report_daily_time);
@@ -210,9 +218,25 @@ export class ApiController {
     return this.job('test_report', { client_id: id });
   }
 
+  // ---------- AI tahlil ----------
+  @Get('clients/:id/analyses')
+  async analyses(@Param('id', ParseIntPipe) id: number) {
+    return this.db.query(
+      `SELECT id, kind, question, findings, ai_json, ai_text, model, error, created_at
+       FROM analyses WHERE client_id=$1 ORDER BY id DESC LIMIT 20`,
+      [id],
+    );
+  }
+
   @Post('clients/:id/diagnostics')
   async diagnosticsNow(@Param('id', ParseIntPipe) id: number) {
-    return this.job('diagnostics_now', { client_id: id });
+    return this.job('ai_analysis', { client_id: id });
+  }
+
+  @Post('clients/:id/ask')
+  async ask(@Param('id', ParseIntPipe) id: number, @Body() b: any) {
+    const question = str(b?.question, 'Savol', 1000);
+    return this.job('ai_question', { client_id: id, question });
   }
 
   // ---------- Alert qoidalari ----------
@@ -258,7 +282,7 @@ export class ApiController {
 
   @Get('jobs/:id')
   async jobStatus(@Param('id', ParseIntPipe) id: number) {
-    return this.db.one('SELECT id, type, status, error, done_at FROM jobs WHERE id=$1', [id]);
+    return this.db.one('SELECT id, type, status, error, result, done_at FROM jobs WHERE id=$1', [id]);
   }
 
   private job(type: string, payload: object) {

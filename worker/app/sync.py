@@ -105,7 +105,7 @@ async def sync_all() -> None:
 
 
 async def fetch_insights(conn_row=None) -> None:
-    """Oxirgi 7 kunlik kunma-kun insights (atributsiya kechikishi uchun har safar qayta yoziladi)."""
+    """Oxirgi 14 kunlik kunma-kun insights (atributsiya kechikishi uchun har safar qayta yoziladi)."""
     conns = [conn_row] if conn_row else await db.fetch("SELECT * FROM connections WHERE platform='meta' AND status='ok'")
     for c in conns:
         accounts = await db.fetch("SELECT id, external_id FROM ad_accounts WHERE connection_id=$1", c["id"])
@@ -113,7 +113,7 @@ async def fetch_insights(conn_row=None) -> None:
             continue
         try:
             client = await _client_for(c)
-            urls = [insights_url(a["external_id"], level="account", date_preset="last_7d", time_increment=1,
+            urls = [insights_url(a["external_id"], level="account", date_preset="last_14d", time_increment=1,
                                  fields=INSIGHT_FIELDS, limit=50) for a in accounts]
             results = await client.batch(urls)
         except MetaError as ex:
