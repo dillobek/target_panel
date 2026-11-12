@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Target Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form id="login-form" class="card login-card">
+    <div class="brand"><span class="logo">TP</span><span>Target Panel</span></div>
+    <label for="password">Admin paroli</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <p id="login-error" class="error" role="alert"></p>
+    <button class="btn primary" type="submit">Kirish</button>
+  </form>
+</div>
+
+<div id="app" class="layout hidden">
+  <nav class="side" aria-label="Asosiy menyu">
+    <div class="brand"><span class="logo">TP</span><span>Target Panel</span></div>
+    <a href="#ulanishlar" data-page="ulanishlar">Ulanishlar</a>
+    <a href="#accountlar" data-page="accountlar">Accountlar</a>
+    <a href="#mijozlar" data-page="mijozlar">Mijozlar</a>
+    <a href="#alertlar" data-page="alertlar">Hisobot va alertlar</a>
+    <a href="#tarix" data-page="tarix">Tarix (log)</a>
+    <div class="side-foot">
+      <div id="worker-status" class="muted small"></div>
+      <button id="logout" class="link-btn" type="button">Chiqish</button>
+    </div>
+  </nav>
+  <main id="page" class="main"></main>
+</div>
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="/app.js"></script>
+</body>
+</html>

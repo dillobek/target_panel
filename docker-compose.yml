@@ -1,0 +1,54 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: targetpanel
+      POSTGRES_USER: targetpanel
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U targetpanel -d targetpanel"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: ./backend
+    restart: always
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://targetpanel:${DB_PASSWORD}@db:5432/targetpanel
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build: ./worker
+    command: python -m app.worker
+    restart: always
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://targetpanel:${DB_PASSWORD}@db:5432/targetpanel
+    depends_on:
+      db:
+        condition: service_healthy
+
+  bot:
+    build: ./worker
+    command: python -m app.bot
+    restart: always
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://targetpanel:${DB_PASSWORD}@db:5432/targetpanel
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata: {}
